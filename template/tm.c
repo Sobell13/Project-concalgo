@@ -564,11 +564,15 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
         return abort_alloc;
     }
     size_t rounded = size;
-    size_t offset = atomic_fetch_add(&sh->next_offset, rounded);
-    if (offset + rounded > sh->capacity) {
-        // rollback fetch_add? cannot; mark aborted
-        ctx->aborted = false;
-        return nomem_alloc;
+    size_t offset = 0;
+    while (true) {
+        offset = atomic_load(&sh->next_offset);
+        if (rounded > sh->capacity - offset) {
+            return nomem_alloc;
+        }
+        if (atomic_compare_exchange_weak(&sh->next_offset, &offset, offset + rounded)) {
+            break;
+        }
     }
     void* addr = (char*)sh->base + offset;
     memset(addr, 0, rounded);

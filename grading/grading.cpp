@@ -262,6 +262,7 @@ EXCEPTION(Shortcut, Any, "Shortcut found");
     EXCEPTION(MultiWordRo, Shortcut, "Incorrect multi-word RO");
     EXCEPTION(MultiTmRw, Shortcut, "Incorrect RW with multiple TMs");
     EXCEPTION(MultiTmRo, Shortcut, "Incorrect RO with multiple TMs");
+    EXCEPTION(OverCapacityAlloc, Shortcut, "Over-capacity allocation consumed space");
     EXCEPTION(WrongAlignment, Shortcut, "Incorrect alignment");
 }
 /** Check whether the students took shortcuts in their implementations.
@@ -343,6 +344,40 @@ static bool check_shortcuts(TransactionalLibrary& tl, Seed seed) {
             auto t2 = ::std::chrono::steady_clock::now();
             ::std::cout << "⎪ Checked in " << ::std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms" << ::std::endl;
         }, "Interleaving multiple TMs took too long.");
+
+        if (true) bounded_run(::std::chrono::milliseconds(200), [&] {
+            auto t1 = ::std::chrono::steady_clock::now();
+            ::std::cout << "⎪ Checking over-capacity allocations leave space intact..." << ::std::endl;
+            size_t constexpr word_size = sizeof(uint64_t);
+            size_t constexpr base_words = 4;
+            size_t constexpr base_size = word_size * base_words;
+            size_t constexpr over_size = base_size * 4; // Larger than remaining capacity
+            TransactionalMemory tm{tl, word_size, base_size};
+            for (int i = 0; i < 16; ++i) {
+                try {
+                    transactional(tm, Transaction::Mode::read_write, [&](auto& tx) {
+                        tx.alloc(over_size);
+                    });
+                    throw Exception::OverCapacityAlloc();
+                } catch (Exception::TransactionAlloc const&) {
+                    // Expected: not enough space.
+                }
+            }
+            uint64_t expected = 0x1badd00dull;
+            void* segment = nullptr;
+            transactional(tm, Transaction::Mode::read_write, [&](auto& tx) {
+                segment = tx.alloc(word_size);
+                tx.write(&expected, sizeof(expected), segment);
+            });
+            uint64_t observed = 0;
+            transactional(tm, Transaction::Mode::read_write, [&](auto& tx) {
+                tx.read(segment, sizeof(observed), &observed);
+            });
+            if (observed != expected)
+                throw Exception::OverCapacityAlloc();
+            auto t2 = ::std::chrono::steady_clock::now();
+            ::std::cout << "⎪ Checked in " << ::std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms" << ::std::endl;
+        }, "Over-capacity allocations impacted subsequent allocations.");
 
         if (true) bounded_run(::std::chrono::milliseconds(1024), [&] {
             auto t1 = ::std::chrono::steady_clock::now();
