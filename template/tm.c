@@ -50,6 +50,8 @@ typedef struct {
     struct segment_meta* meta;
     bool    new_node;
     bool    reserved_from_free;
+    size_t offset;
+    bool   from_free_list;
 } alloc_entry_t;
 
 typedef struct segment_meta {
@@ -71,6 +73,14 @@ typedef struct {
     unsigned int version;
 } read_entry_t;
 
+static int cmp_size_t(const void* a, const void* b) {
+    size_t lhs = *(const size_t*)a;
+    size_t rhs = *(const size_t*)b;
+    if (lhs < rhs) return -1;
+    if (lhs > rhs) return 1;
+    return 0;
+}
+
 typedef struct {
     // Shared region description
     void*        base;
@@ -83,7 +93,17 @@ typedef struct {
     atomic_uint* locks;    // per-word lock: 0 free, 1 locked
     atomic_flag  meta_lock;
     segment_meta_t* segments;
+
+    // Allocation recycling
+    atomic_flag  alloc_lock;
+    struct free_node* free_list;
 } shared_region_t;
+
+typedef struct free_node {
+    void* addr;
+    size_t size;
+    struct free_node* next;
+} free_node_t;
 
 typedef struct {
     bool      is_ro;
@@ -198,6 +218,85 @@ static inline void meta_lock(shared_region_t* sh) {
 
 static inline void meta_unlock(shared_region_t* sh) {
     atomic_flag_clear(&sh->meta_lock);
+static inline void lock_alloc(shared_region_t* sh) {
+    while (atomic_flag_test_and_set_explicit(&sh->alloc_lock, memory_order_acquire)) {
+        // spin
+    }
+}
+
+static inline void unlock_alloc(shared_region_t* sh) {
+    atomic_flag_clear_explicit(&sh->alloc_lock, memory_order_release);
+}
+
+static bool pop_free_segment(shared_region_t* sh, size_t size, void** addr) {
+    bool found = false;
+    lock_alloc(sh);
+    free_node_t** cur = &sh->free_list;
+    while (*cur) {
+        if ((*cur)->size >= size) {
+            free_node_t* node = *cur;
+            *addr = node->addr;
+            *cur = node->next;
+            free(node);
+            found = true;
+            break;
+        }
+        cur = &(*cur)->next;
+    }
+    unlock_alloc(sh);
+    return found;
+}
+
+static void push_free_segment(shared_region_t* sh, void* addr, size_t size) {
+    free_node_t* node = malloc(sizeof(*node));
+    if (!node) return;
+    node->addr = addr;
+    node->size = size;
+    lock_alloc(sh);
+    node->next = sh->free_list;
+    sh->free_list = node;
+    unlock_alloc(sh);
+}
+
+static void recycle_allocations(shared_region_t* sh, tx_ctx_t* ctx) {
+    size_t current = atomic_load(&sh->next_offset);
+    for (size_t i = ctx->alloc_len; i-- > 0; ) {
+        alloc_entry_t* a = &ctx->allocs[i];
+        if (a->from_free_list) {
+            continue;
+        }
+        size_t expected = current;
+        while (a->offset + a->size == expected) {
+            if (atomic_compare_exchange_weak(&sh->next_offset, &expected, a->offset)) {
+                a->size = 0;
+                current = a->offset;
+                break;
+            }
+            expected = atomic_load(&sh->next_offset);
+        }
+        current = atomic_load(&sh->next_offset);
+    }
+    for (size_t i = 0; i < ctx->alloc_len; ++i) {
+        if (ctx->allocs[i].size == 0) continue;
+        push_free_segment(sh, ctx->allocs[i].addr, ctx->allocs[i].size);
+    }
+}
+
+static void free_ctx_buffers(tx_ctx_t* ctx) {
+    free(ctx->reads);
+    for (size_t i = 0; i < ctx->write_len; ++i) {
+        free(ctx->writes[i].buf);
+    }
+    free(ctx->writes);
+    free(ctx->allocs);
+    free(ctx);
+}
+
+static void cleanup_ctx(shared_region_t* sh, tx_ctx_t* ctx, bool committed) {
+    if (!committed) {
+        recycle_allocations(sh, ctx);
+    }
+    free_ctx_buffers(ctx);
 }
 
 // -------------------------------------------------------------------------- //
@@ -259,6 +358,8 @@ shared_t tm_create(size_t unused(size), size_t unused(align)) {
     sh->locks      = locks;
     atomic_flag_clear(&sh->meta_lock);
     sh->segments   = NULL;
+    atomic_flag_clear(&sh->alloc_lock);
+    sh->free_list  = NULL;
 
     return (shared_t)sh;
 }
@@ -274,6 +375,10 @@ void tm_destroy(shared_t unused(shared)) {
         segment_meta_t* nxt = cur->next;
         free(cur);
         cur = nxt;
+    while (sh->free_list) {
+        free_node_t* next = sh->free_list->next;
+        free(sh->free_list);
+        sh->free_list = next;
     }
     free(sh->versions);
     free(sh->locks);
@@ -356,6 +461,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
         free(ctx->allocs);
         free(ctx->frees);
         free(ctx);
+        cleanup_ctx(sh, ctx, false);
         return false;
     }
 
@@ -382,6 +488,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
         free(ctx->allocs);
         free(ctx->frees);
         free(ctx);
+        cleanup_ctx(sh, ctx, committed);
         return committed;
     }
 
@@ -436,17 +543,16 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
                 } else if (lock_indices[j] == lock_indices[i]) {
                     // remove duplicates by marking
                     lock_indices[j] = SIZE_MAX;
+        if (lock_count > 1) {
+            qsort(lock_indices, lock_count, sizeof(size_t), cmp_size_t);
+            size_t unique_count = 1;
+            for (size_t i = 1; i < lock_count; ++i) {
+                if (lock_indices[i] != lock_indices[unique_count - 1]) {
+                    lock_indices[unique_count++] = lock_indices[i];
                 }
             }
+            lock_count = unique_count;
         }
-        // compact duplicates
-        size_t new_count = 0;
-        for (size_t i = 0; i < lock_count; ++i) {
-            if (lock_indices[i] != SIZE_MAX) {
-                lock_indices[new_count++] = lock_indices[i];
-            }
-        }
-        lock_count = new_count;
     }
 
     // Acquire locks
@@ -545,6 +651,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
     free(ctx->allocs);
     free(ctx->frees);
     free(ctx);
+    cleanup_ctx(sh, ctx, committed);
 
     return committed;
 }
@@ -561,7 +668,7 @@ bool tm_read(shared_t unused(shared), tx_t unused(tx), void const* unused(source
     shared_region_t* sh = as_shared(shared);
     tx_ctx_t* ctx       = as_tx(tx);
     if (!sh || !ctx || !source || !target) return false;
-    if (!size_aligned(sh, size) || !addr_aligned(sh, source) || !addr_aligned(sh, target)) {
+    if (!size_aligned(sh, size) || !addr_aligned(sh, source)) {
         ctx->aborted = true;
         return false;
     }
@@ -727,6 +834,61 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
     if (offset + rounded > sh->capacity) {
         ctx->aborted = false;
         return nomem_alloc;
+    void* addr = NULL;
+
+    // Try to reuse freed segments first
+    if (!pop_free_segment(sh, rounded, &addr)) {
+        size_t offset = atomic_load(&sh->next_offset);
+        size_t offset_value = 0;
+        while (true) {
+            if (offset + rounded > sh->capacity) {
+                return nomem_alloc;
+            }
+            size_t desired = offset + rounded;
+            if (atomic_compare_exchange_weak(&sh->next_offset, &offset, desired)) {
+                addr = (char*)sh->base + offset;
+                offset_value = offset;
+                break;
+            }
+        }
+        memset(addr, 0, rounded);
+        if (!ensure_alloc_cap(ctx, 1)) {
+            ctx->aborted = true;
+            size_t expected = offset_value + rounded;
+            if (!atomic_compare_exchange_strong(&sh->next_offset, &expected, offset_value)) {
+                push_free_segment(sh, addr, rounded);
+            }
+            return abort_alloc;
+        }
+        ctx->allocs[ctx->alloc_len++] = (alloc_entry_t){
+            .addr = addr,
+            .size = rounded,
+            .offset = offset_value,
+            .from_free_list = false
+        };
+    } else {
+        memset(addr, 0, rounded);
+        size_t offset_value = (uintptr_t)addr - (uintptr_t)sh->base;
+        if (!ensure_alloc_cap(ctx, 1)) {
+            ctx->aborted = true;
+            push_free_segment(sh, addr, rounded);
+            return abort_alloc;
+        }
+        ctx->allocs[ctx->alloc_len++] = (alloc_entry_t){
+            .addr = addr,
+            .size = rounded,
+            .offset = offset_value,
+            .from_free_list = true
+        };
+    size_t offset = 0;
+    while (true) {
+        offset = atomic_load(&sh->next_offset);
+        if (rounded > sh->capacity - offset) {
+            return nomem_alloc;
+        }
+        if (atomic_compare_exchange_weak(&sh->next_offset, &offset, offset + rounded)) {
+            break;
+        }
     }
     void* addr = (char*)sh->base + offset;
     memset(addr, 0, rounded);
