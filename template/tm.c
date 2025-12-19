@@ -54,6 +54,14 @@ typedef struct {
     unsigned int version;
 } read_entry_t;
 
+static int cmp_size_t(const void* a, const void* b) {
+    size_t lhs = *(const size_t*)a;
+    size_t rhs = *(const size_t*)b;
+    if (lhs < rhs) return -1;
+    if (lhs > rhs) return 1;
+    return 0;
+}
+
 typedef struct {
     // Shared region description
     void*        base;
@@ -338,27 +346,16 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
                 lock_indices[lock_count++] = idx;
             }
         }
-        // sort indices
-        for (size_t i = 0; i + 1 < lock_count; ++i) {
-            for (size_t j = i + 1; j < lock_count; ++j) {
-                if (lock_indices[j] < lock_indices[i]) {
-                    size_t tmp = lock_indices[i];
-                    lock_indices[i] = lock_indices[j];
-                    lock_indices[j] = tmp;
-                } else if (lock_indices[j] == lock_indices[i]) {
-                    // remove duplicates by marking
-                    lock_indices[j] = SIZE_MAX;
+        if (lock_count > 1) {
+            qsort(lock_indices, lock_count, sizeof(size_t), cmp_size_t);
+            size_t unique_count = 1;
+            for (size_t i = 1; i < lock_count; ++i) {
+                if (lock_indices[i] != lock_indices[unique_count - 1]) {
+                    lock_indices[unique_count++] = lock_indices[i];
                 }
             }
+            lock_count = unique_count;
         }
-        // compact duplicates
-        size_t new_count = 0;
-        for (size_t i = 0; i < lock_count; ++i) {
-            if (lock_indices[i] != SIZE_MAX) {
-                lock_indices[new_count++] = lock_indices[i];
-            }
-        }
-        lock_count = new_count;
     }
 
     // Acquire locks
