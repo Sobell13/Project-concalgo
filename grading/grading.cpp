@@ -497,6 +497,46 @@ static bool check_shortcuts(TransactionalLibrary& tl, Seed seed) {
             ::std::cout << "⎪ Checked in " << ::std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms" << ::std::endl;
         }, "Repeatedly allocating a large TM took too long.");
 
+        if (true) bounded_run(::std::chrono::milliseconds(4000), [&] {
+            auto t1 = ::std::chrono::steady_clock::now();
+            ::std::cout << "⎪ Stress-testing allocation cleanup on aborts..." << ::std::endl;
+            size_t constexpr word_size = sizeof(uint64_t);
+            size_t constexpr base_words = 8;
+            size_t constexpr chunk_size = word_size;
+            unsigned constexpr nbthreads = 4;
+            unsigned constexpr commits_per_thread = 7;
+            TransactionalMemory tm{tl, word_size, word_size * base_words};
+            ::std::atomic<bool> start_flag{false};
+            ::std::vector<::std::thread> workers;
+            workers.reserve(nbthreads);
+            for (unsigned tid = 0; tid < nbthreads; ++tid) {
+                workers.emplace_back([&, tid]() {
+                    while (!start_flag.load(::std::memory_order_acquire)) {
+                        short_pause();
+                    }
+                    for (unsigned iter = 0; iter < commits_per_thread; ++iter) {
+                        transactional(tm, Transaction::Mode::read_write, [&](auto& tx) {
+                            void* seg = tx.alloc(chunk_size);
+                            auto value = static_cast<uint64_t>(tid * commits_per_thread + iter);
+                            tx.write(&value, word_size, tm.get_start());
+                            tx.write(&value, word_size, seg);
+                        });
+                    }
+                });
+            }
+            start_flag.store(true, ::std::memory_order_release);
+            for (auto& worker : workers) {
+                worker.join();
+            }
+            transactional(tm, Transaction::Mode::read_write, [&](auto& tx) {
+                void* seg = tx.alloc(chunk_size);
+                uint64_t marker = 0xfeedbeefUL;
+                tx.write(&marker, word_size, seg);
+            });
+            auto t2 = ::std::chrono::steady_clock::now();
+            ::std::cout << "⎪ Checked in " << ::std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms" << ::std::endl;
+        }, "Stress-testing allocation cleanup on aborts took too long.");
+
         if (true)  bounded_run(::std::chrono::milliseconds(10000 * 16), [&] {
             auto t1 = ::std::chrono::steady_clock::now();
             ::std::cout << "⎪ Checking whether freed memory is recycled..." << ::std::endl;
