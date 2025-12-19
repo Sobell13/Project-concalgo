@@ -263,6 +263,7 @@ EXCEPTION(Shortcut, Any, "Shortcut found");
     EXCEPTION(MultiTmRw, Shortcut, "Incorrect RW with multiple TMs");
     EXCEPTION(MultiTmRo, Shortcut, "Incorrect RO with multiple TMs");
     EXCEPTION(WrongAlignment, Shortcut, "Incorrect alignment");
+    EXCEPTION(UnalignedTarget, Shortcut, "Incorrect handling of unaligned private read targets");
 }
 /** Check whether the students took shortcuts in their implementations.
  * @param tl     Transactional library to check
@@ -301,6 +302,28 @@ static bool check_shortcuts(TransactionalLibrary& tl, Seed seed) {
             auto t2 = ::std::chrono::steady_clock::now();
             ::std::cout << "⎪ Checked in " << ::std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms" << ::std::endl;
         }, "Reading/writing multiple words with different alignments took too long.");
+        if (true) bounded_run(::std::chrono::milliseconds(100), [&] {
+            auto t1 = ::std::chrono::steady_clock::now();
+            ::std::cout << "⎪ Checking read into unaligned private buffer..." << ::std::endl;
+            size_t constexpr word_size = sizeof(uint64_t);
+            TransactionalMemory tm{tl, word_size, word_size};
+            uint64_t const reference = 0x1122334455667788ull;
+            transactional(tm, Transaction::Mode::read_write, [&](auto& tx) {
+                tx.write(&reference, sizeof(reference), tm.get_start());
+            });
+            uint8_t buffer[sizeof(reference) + sizeof(uint64_t)];
+            auto* target = buffer + 1;
+            ::std::memset(buffer, 0, sizeof(buffer));
+            transactional(tm, Transaction::Mode::read_only, [&](auto& tx) {
+                tx.read(tm.get_start(), sizeof(reference), target);
+            });
+            uint64_t observed;
+            ::std::memcpy(&observed, target, sizeof(observed));
+            if (observed != reference)
+                throw Exception::UnalignedTarget();
+            auto t2 = ::std::chrono::steady_clock::now();
+            ::std::cout << "⎪ Checked in " << ::std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count() << " ms" << ::std::endl;
+        }, "Reading into an unaligned private buffer took too long.");
 
         if (true) bounded_run(::std::chrono::milliseconds(1000), [&] {
             auto t1 = ::std::chrono::steady_clock::now();
