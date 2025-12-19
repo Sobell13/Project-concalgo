@@ -56,6 +56,14 @@ typedef struct {
     unsigned int version;
 } read_entry_t;
 
+static int cmp_size_t(const void* a, const void* b) {
+    size_t lhs = *(const size_t*)a;
+    size_t rhs = *(const size_t*)b;
+    if (lhs < rhs) return -1;
+    if (lhs > rhs) return 1;
+    return 0;
+}
+
 typedef struct {
     // Shared region description
     void*        base;
@@ -426,27 +434,16 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
                 lock_indices[lock_count++] = idx;
             }
         }
-        // sort indices
-        for (size_t i = 0; i + 1 < lock_count; ++i) {
-            for (size_t j = i + 1; j < lock_count; ++j) {
-                if (lock_indices[j] < lock_indices[i]) {
-                    size_t tmp = lock_indices[i];
-                    lock_indices[i] = lock_indices[j];
-                    lock_indices[j] = tmp;
-                } else if (lock_indices[j] == lock_indices[i]) {
-                    // remove duplicates by marking
-                    lock_indices[j] = SIZE_MAX;
+        if (lock_count > 1) {
+            qsort(lock_indices, lock_count, sizeof(size_t), cmp_size_t);
+            size_t unique_count = 1;
+            for (size_t i = 1; i < lock_count; ++i) {
+                if (lock_indices[i] != lock_indices[unique_count - 1]) {
+                    lock_indices[unique_count++] = lock_indices[i];
                 }
             }
+            lock_count = unique_count;
         }
-        // compact duplicates
-        size_t new_count = 0;
-        for (size_t i = 0; i < lock_count; ++i) {
-            if (lock_indices[i] != SIZE_MAX) {
-                lock_indices[new_count++] = lock_indices[i];
-            }
-        }
-        lock_count = new_count;
     }
 
     // Acquire locks
@@ -531,7 +528,7 @@ bool tm_read(shared_t unused(shared), tx_t unused(tx), void const* unused(source
     shared_region_t* sh = as_shared(shared);
     tx_ctx_t* ctx       = as_tx(tx);
     if (!sh || !ctx || !source || !target) return false;
-    if (!size_aligned(sh, size) || !addr_aligned(sh, source) || !addr_aligned(sh, target)) {
+    if (!size_aligned(sh, size) || !addr_aligned(sh, source)) {
         ctx->aborted = true;
         return false;
     }
@@ -692,6 +689,22 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
             .offset = offset_value,
             .from_free_list = true
         };
+    size_t offset = 0;
+    while (true) {
+        offset = atomic_load(&sh->next_offset);
+        if (rounded > sh->capacity - offset) {
+            return nomem_alloc;
+        }
+        if (atomic_compare_exchange_weak(&sh->next_offset, &offset, offset + rounded)) {
+            break;
+        }
+    }
+    void* addr = (char*)sh->base + offset;
+    memset(addr, 0, rounded);
+
+    if (!ensure_alloc_cap(ctx, 1)) {
+        ctx->aborted = true;
+        return abort_alloc;
     }
     *target = addr;
     return success_alloc;
