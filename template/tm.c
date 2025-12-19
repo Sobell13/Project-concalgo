@@ -47,7 +47,24 @@ typedef struct {
 typedef struct {
     void*  addr;
     size_t size;
+    struct segment_meta* meta;
+    bool    new_node;
+    bool    reserved_from_free;
 } alloc_entry_t;
+
+typedef struct segment_meta {
+    void* addr;
+    size_t size;
+    bool is_free;
+    struct segment_meta* next;
+} segment_meta_t;
+
+typedef struct {
+    void* addr;
+    size_t size;
+    segment_meta_t* meta;
+    bool from_new_alloc;
+} free_entry_t;
 
 typedef struct {
     size_t idx;
@@ -64,6 +81,8 @@ typedef struct {
     atomic_uint  gvc;
     atomic_uint* versions; // per-word version
     atomic_uint* locks;    // per-word lock: 0 free, 1 locked
+    atomic_flag  meta_lock;
+    segment_meta_t* segments;
 } shared_region_t;
 
 typedef struct {
@@ -82,6 +101,10 @@ typedef struct {
     alloc_entry_t* allocs;
     size_t         alloc_len;
     size_t         alloc_cap;
+
+    free_entry_t* frees;
+    size_t        free_len;
+    size_t        free_cap;
 } tx_ctx_t;
 
 // -------------------------------------------------------------------------- //
@@ -140,6 +163,21 @@ static bool ensure_alloc_cap(tx_ctx_t* tx, size_t extra) {
     return true;
 }
 
+static bool ensure_free_cap(tx_ctx_t* tx, size_t extra) {
+    if (tx->free_len + extra <= tx->free_cap) {
+        return true;
+    }
+    size_t new_cap = tx->free_cap ? tx->free_cap * 2 : 2;
+    while (new_cap < tx->free_len + extra) {
+        new_cap *= 2;
+    }
+    free_entry_t* nf = realloc(tx->frees, new_cap * sizeof(*nf));
+    if (!nf) return false;
+    tx->frees = nf;
+    tx->free_cap = new_cap;
+    return true;
+}
+
 static inline size_t word_index(shared_region_t* sh, void* addr) {
     return ((uintptr_t)addr - (uintptr_t)sh->base) / sh->align;
 }
@@ -150,6 +188,16 @@ static inline bool addr_aligned(shared_region_t* sh, void const* addr) {
 
 static inline bool size_aligned(shared_region_t* sh, size_t size) {
     return size > 0 && (size % sh->align) == 0;
+}
+
+static inline void meta_lock(shared_region_t* sh) {
+    while (atomic_flag_test_and_set(&sh->meta_lock)) {
+        ; // spin
+    }
+}
+
+static inline void meta_unlock(shared_region_t* sh) {
+    atomic_flag_clear(&sh->meta_lock);
 }
 
 // -------------------------------------------------------------------------- //
@@ -209,6 +257,8 @@ shared_t tm_create(size_t unused(size), size_t unused(align)) {
     atomic_init(&sh->gvc, 0u);
     sh->versions   = versions;
     sh->locks      = locks;
+    atomic_flag_clear(&sh->meta_lock);
+    sh->segments   = NULL;
 
     return (shared_t)sh;
 }
@@ -219,6 +269,12 @@ shared_t tm_create(size_t unused(size), size_t unused(align)) {
 void tm_destroy(shared_t unused(shared)) {
     shared_region_t* sh = as_shared(shared);
     if (!sh) return;
+    segment_meta_t* cur = sh->segments;
+    while (cur) {
+        segment_meta_t* nxt = cur->next;
+        free(cur);
+        cur = nxt;
+    }
     free(sh->versions);
     free(sh->locks);
     free(sh->base);
@@ -284,12 +340,21 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
     tx_ctx_t* ctx       = as_tx(tx);
     if (!sh || !ctx) return false;
     if (ctx->aborted) {
+        meta_lock(sh);
+        for (size_t i = 0; i < ctx->alloc_len; ++i) {
+            alloc_entry_t* a = &ctx->allocs[i];
+            if (a->reserved_from_free || a->new_node) {
+                a->meta->is_free = true;
+            }
+        }
+        meta_unlock(sh);
         free(ctx->reads);
         free(ctx->writes);
         for (size_t i = 0; i < ctx->write_len; ++i) {
             free(ctx->writes[i].buf);
         }
         free(ctx->allocs);
+        free(ctx->frees);
         free(ctx);
         return false;
     }
@@ -315,6 +380,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
             free(ctx->writes[i].buf);
         }
         free(ctx->allocs);
+        free(ctx->frees);
         free(ctx);
         return committed;
     }
@@ -323,6 +389,12 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
     size_t max_words = 0;
     for (size_t i = 0; i < ctx->write_len; ++i) {
         max_words += ctx->writes[i].size / sh->align;
+    }
+    for (size_t i = 0; i < ctx->alloc_len; ++i) {
+        max_words += ctx->allocs[i].size / sh->align;
+    }
+    for (size_t i = 0; i < ctx->free_len; ++i) {
+        max_words += ctx->frees[i].size / sh->align;
     }
     size_t* lock_indices = max_words ? malloc(max_words * sizeof(size_t)) : NULL;
     size_t lock_count = 0;
@@ -335,6 +407,22 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
             size_t words = w->size / sh->align;
             for (size_t j = 0; j < words; ++j) {
                 size_t idx = word_index(sh, (char*)w->addr + j * sh->align);
+                lock_indices[lock_count++] = idx;
+            }
+        }
+        for (size_t i = 0; i < ctx->alloc_len; ++i) {
+            alloc_entry_t* a = &ctx->allocs[i];
+            size_t words = a->size / sh->align;
+            for (size_t j = 0; j < words; ++j) {
+                size_t idx = word_index(sh, (char*)a->addr + j * sh->align);
+                lock_indices[lock_count++] = idx;
+            }
+        }
+        for (size_t i = 0; i < ctx->free_len; ++i) {
+            free_entry_t* f = &ctx->frees[i];
+            size_t words = f->size / sh->align;
+            for (size_t j = 0; j < words; ++j) {
+                size_t idx = word_index(sh, (char*)f->addr + j * sh->align);
                 lock_indices[lock_count++] = idx;
             }
         }
@@ -414,7 +502,30 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
                 atomic_store(&sh->versions[idx], wv);
             }
         }
+        // Apply frees
+        meta_lock(sh);
+        for (size_t i = 0; i < ctx->free_len; ++i) {
+            free_entry_t* f = &ctx->frees[i];
+            memset(f->addr, 0, f->size);
+            size_t words = f->size / sh->align;
+            for (size_t j = 0; j < words; ++j) {
+                size_t idx = word_index(sh, (char*)f->addr + j * sh->align);
+                atomic_store(&sh->versions[idx], wv);
+            }
+            f->meta->is_free = true;
+        }
+        meta_unlock(sh);
         committed = true;
+    }
+    if (!committed) {
+        meta_lock(sh);
+        for (size_t i = 0; i < ctx->alloc_len; ++i) {
+            alloc_entry_t* a = &ctx->allocs[i];
+            if (a->reserved_from_free || a->new_node) {
+                a->meta->is_free = true;
+            }
+        }
+        meta_unlock(sh);
     }
 
     // Release locks
@@ -432,6 +543,7 @@ bool tm_end(shared_t unused(shared), tx_t unused(tx)) {
     }
     free(ctx->writes);
     free(ctx->allocs);
+    free(ctx->frees);
     free(ctx);
 
     return committed;
@@ -564,25 +676,82 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
         return abort_alloc;
     }
     size_t rounded = size;
+    if (!ensure_alloc_cap(ctx, 1)) {
+        ctx->aborted = true;
+        return abort_alloc;
+    }
+
+    // Reuse freed blocks inside this transaction first
+    for (size_t i = 0; i < ctx->free_len; ++i) {
+        if (ctx->frees[i].size == rounded) {
+            free_entry_t chosen = ctx->frees[i];
+            ctx->frees[i] = ctx->frees[ctx->free_len - 1];
+            ctx->free_len--;
+            ctx->allocs[ctx->alloc_len++] = (alloc_entry_t){
+                .addr = chosen.addr,
+                .size = chosen.size,
+                .meta = chosen.meta,
+                .new_node = chosen.from_new_alloc,
+                .reserved_from_free = false
+            };
+            *target = chosen.addr;
+            return success_alloc;
+        }
+    }
+
+    // Try to reuse globally freed blocks
+    segment_meta_t* found = NULL;
+    meta_lock(sh);
+    for (segment_meta_t* cur = sh->segments; cur; cur = cur->next) {
+        if (cur->is_free && cur->size == rounded) {
+            cur->is_free = false;
+            found = cur;
+            break;
+        }
+    }
+    meta_unlock(sh);
+    if (found) {
+        ctx->allocs[ctx->alloc_len++] = (alloc_entry_t){
+            .addr = found->addr,
+            .size = found->size,
+            .meta = found,
+            .new_node = false,
+            .reserved_from_free = true
+        };
+        *target = found->addr;
+        return success_alloc;
+    }
+
+    // Fresh allocation
     size_t offset = atomic_fetch_add(&sh->next_offset, rounded);
     if (offset + rounded > sh->capacity) {
-        // rollback fetch_add? cannot; mark aborted
         ctx->aborted = false;
         return nomem_alloc;
     }
     void* addr = (char*)sh->base + offset;
     memset(addr, 0, rounded);
 
-    if (!ensure_alloc_cap(ctx, 1)) {
+    segment_meta_t* meta = malloc(sizeof(*meta));
+    if (!meta) {
         ctx->aborted = true;
         return abort_alloc;
     }
-    ctx->allocs[ctx->alloc_len++] = (alloc_entry_t){ .addr = addr, .size = rounded };
+    meta->addr = addr;
+    meta->size = rounded;
+    meta->is_free = false;
+    meta_lock(sh);
+    meta->next = sh->segments;
+    sh->segments = meta;
+    meta_unlock(sh);
+
+    ctx->allocs[ctx->alloc_len++] = (alloc_entry_t){
+        .addr = addr,
+        .size = rounded,
+        .meta = meta,
+        .new_node = true,
+        .reserved_from_free = false
+    };
     *target = addr;
-    if (!*target) {
-        ctx->aborted = true;
-        return abort_alloc;
-    }
     return success_alloc;
 }
 
@@ -593,8 +762,56 @@ alloc_t tm_alloc(shared_t unused(shared), tx_t unused(tx), size_t unused(size), 
  * @return Whether the whole transaction can continue
 **/
 bool tm_free(shared_t unused(shared), tx_t unused(tx), void* unused(target)) {
-    // Simplified: not supported; abort on free attempt.
-    tx_ctx_t* ctx = as_tx(tx);
-    if (ctx) ctx->aborted = true;
-    return false;
+    shared_region_t* sh = as_shared(shared);
+    tx_ctx_t* ctx       = as_tx(tx);
+    if (!sh || !ctx || !target) return false;
+    if (ctx->is_ro) {
+        ctx->aborted = true;
+        return false;
+    }
+    if (!addr_aligned(sh, target)) {
+        ctx->aborted = true;
+        return false;
+    }
+    if (!ensure_free_cap(ctx, 1)) {
+        ctx->aborted = true;
+        return false;
+    }
+
+    meta_lock(sh);
+    segment_meta_t* meta = NULL;
+    for (segment_meta_t* cur = sh->segments; cur; cur = cur->next) {
+        if (cur->addr == target) {
+            meta = cur;
+            break;
+        }
+    }
+    if (!meta || meta->is_free) {
+        meta_unlock(sh);
+        ctx->aborted = true;
+        return false;
+    }
+    // Avoid duplicate free within same transaction
+    for (size_t i = 0; i < ctx->free_len; ++i) {
+        if (ctx->frees[i].addr == target) {
+            meta_unlock(sh);
+            ctx->aborted = true;
+            return false;
+        }
+    }
+    bool allocated_here = false;
+    for (size_t i = 0; i < ctx->alloc_len; ++i) {
+        if (ctx->allocs[i].meta == meta) {
+            allocated_here = true;
+            break;
+        }
+    }
+    ctx->frees[ctx->free_len++] = (free_entry_t){
+        .addr = target,
+        .size = meta->size,
+        .meta = meta,
+        .from_new_alloc = allocated_here
+    };
+    meta_unlock(sh);
+    return true;
 }

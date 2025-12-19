@@ -330,6 +330,19 @@ public:
 
         barrier.sync();
         if (uid == 0) { // Only the first thread initializes the shared memory.
+            // Check that a freed block can be reused within the same transaction.
+            auto reuse_ok = transactional(tm, Transaction::Mode::read_write, [&](Transaction& tx) {
+                void* first = tx.alloc(tm.get_align());
+                tx.free(first);
+                void* second = tx.alloc(tm.get_align());
+                return first == second;
+            });
+            if (unlikely(!reuse_ok)) {
+                barrier.sync();
+                barrier.sync();
+                return "Failed to reuse freed allocation";
+            }
+
             // We first write the initial value,
             auto init_counter = nbtxperwrk * nbworkers;
             transactional(tm, Transaction::Mode::read_write, [&](Transaction& tx) {
