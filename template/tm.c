@@ -446,7 +446,7 @@ bool tm_read(shared_t unused(shared), tx_t unused(tx), void const* unused(source
     shared_region_t* sh = as_shared(shared);
     tx_ctx_t* ctx       = as_tx(tx);
     if (!sh || !ctx || !source || !target) return false;
-    if (!size_aligned(sh, size) || !addr_aligned(sh, source) || !addr_aligned(sh, target)) {
+    if (!size_aligned(sh, size) || !addr_aligned(sh, source)) {
         ctx->aborted = true;
         return false;
     }
